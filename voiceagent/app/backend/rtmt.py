@@ -1,86 +1,107 @@
-# originally from https://github.com/Azure-Samples/aisearch-openai-rag-audio/blob/main/app/backend/rtmt.py
-
+from dataclasses import dataclass
 import asyncio
 import json
 import logging
-from enum import Enum
-from typing import Any, Callable, Optional
+from enum import Enum, auto
+from typing import Any, Callable, Dict, Optional, Set, Union
 
 import aiohttp
 from aiohttp import web
 from azure.core.credentials import AzureKeyCredential
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 
+# Configure logging
 logger = logging.getLogger("voicerag")
 
+# Message types
+class MessageType(Enum):
+    SESSION_CREATED = "session.created"
+    SESSION_UPDATE = "session.update"
+    RESPONSE_OUTPUT_ADDED = "response.output_item.added"
+    CONVERSATION_ITEM_CREATED = "conversation.item.created"
+    FUNCTION_CALL_ARGS_DELTA = "response.function_call_arguments.delta"
+    FUNCTION_CALL_ARGS_DONE = "response.function_call_arguments.done"
+    RESPONSE_OUTPUT_DONE = "response.output_item.done"
+    RESPONSE_DONE = "response.done"
+
 class ToolResultDirection(Enum):
-    TO_SERVER = 1
-    TO_CLIENT = 2
+    TO_SERVER = auto()
+    TO_CLIENT = auto()
 
-class ToolResult:
-    text: str
-    destination: ToolResultDirection
-
-    def __init__(self, text: str, destination: ToolResultDirection):
-        self.text = text
-        self.destination = destination
-
-    def to_text(self) -> str:
-        if self.text is None:
-            return ""
-        return self.text if type(self.text) == str else json.dumps(self.text)
-
-class Tool:
-    target: Callable[..., ToolResult]
-    schema: Any
-
-    def __init__(self, target: Any, schema: Any):
-        self.target = target
-        self.schema = schema
-
-class RTToolCall:
-    tool_call_id: str
-    previous_id: str
-
-    def __init__(self, tool_call_id: str, previous_id: str):
-        self.tool_call_id = tool_call_id
-        self.previous_id = previous_id
-
-class RTMiddleTier:
+@dataclass
+class RTMTConfig:
+    """Configuration for RT Middle Tier."""
     endpoint: str
     deployment: str
-    key: Optional[str] = None
-    
-    # Tools are server-side only for now, though the case could be made for client-side tools
-    # in addition to server-side tools that are invisible to the client
-    tools: dict[str, Tool] = {}
-
-    # Server-enforced configuration, if set, these will override the client's configuration
-    # Typically at least the model name and system message will be set by the server
+    api_version: str = "2024-10-01-preview"
     model: Optional[str] = None
     system_message: Optional[str] = None
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
     disable_audio: Optional[bool] = None
     voice_choice: Optional[str] = None
-    api_version: str = "2024-10-01-preview"
-    _tools_pending = {}
-    _token_provider = None
 
-    # Add a collection to track websocket connections
-    _connected_clients = set()
+@dataclass
+class ToolResult:
+    """Result from a tool execution."""
+    text: str
+    destination: ToolResultDirection
 
-    def __init__(self, endpoint: str, deployment: str, credentials: AzureKeyCredential | DefaultAzureCredential, voice_choice: Optional[str] = None):
-        self.endpoint = endpoint
-        self.deployment = deployment
-        self.voice_choice = voice_choice
-        if voice_choice is not None:
-            logger.info("Realtime voice choice set to %s", voice_choice)
+    def to_text(self) -> str:
+        """Convert tool result to text format."""
+        if self.text is None:
+            return ""
+        return self.text if isinstance(self.text, str) else json.dumps(self.text)
+
+class Tool:
+    """Tool definition and execution."""
+    def __init__(self, target: Callable[..., ToolResult], schema: Any):
+        self.target = target
+        self.schema = schema
+
+class RTToolCall:
+    """Represents an ongoing tool call."""
+    def __init__(self, tool_call_id: str, previous_id: str):
+        self.tool_call_id = tool_call_id
+        self.previous_id = previous_id
+
+class WebSocketMessageHandler:
+    """Handles WebSocket message processing."""
+    @staticmethod
+    async def process_client_message(message: Dict[str, Any], session: Dict[str, Any], tools: Dict[str, Tool]) -> Optional[str]:
+        """Process messages from client to server."""
+        if message["type"] == MessageType.SESSION_UPDATE.value:
+            WebSocketMessageHandler._update_session_config(session, tools)
+            return json.dumps({"type": MessageType.SESSION_UPDATE.value, "session": session})
+        return None
+
+    @staticmethod
+    def _update_session_config(session: Dict[str, Any], tools: Dict[str, Tool]) -> None:
+        """Update session configuration with tool settings."""
+        session["tool_choice"] = "auto" if tools else "none"
+        session["tools"] = [tool.schema for tool in tools.values()]
+
+class RTMiddleTier:
+    """Real-Time Middle Tier for handling WebSocket communications."""
+    
+    def __init__(self, endpoint: str, deployment: str, 
+                 credentials: Union[AzureKeyCredential, DefaultAzureCredential], 
+                 voice_choice: Optional[str] = None):
+        self.config = RTMTConfig(endpoint=endpoint, deployment=deployment, voice_choice=voice_choice)
+        self.tools: Dict[str, Tool] = {}
+        self._tools_pending: Dict[str, RTToolCall] = {}
+        self._connected_clients: Set[web.WebSocketResponse] = set()
+        
         if isinstance(credentials, AzureKeyCredential):
             self.key = credentials.key
+            self._token_provider = None
         else:
-            self._token_provider = get_bearer_token_provider(credentials, "https://cognitiveservices.azure.com/.default")
-            self._token_provider() # Warm up during startup so we have a token cached when the first request arrives
+            self.key = None
+            self._token_provider = get_bearer_token_provider(
+                credentials, 
+                "https://cognitiveservices.azure.com/.default"
+            )
+            self._token_provider()  # Warm up token cache
 
     async def _process_message_to_client(self, msg: str, client_ws: web.WebSocketResponse, server_ws: web.WebSocketResponse) -> Optional[str]:
         try:
@@ -88,20 +109,20 @@ class RTMiddleTier:
             updated_message = msg.data
             if message is not None:
                 match message["type"]:
-                    case "session.created":
+                    case MessageType.SESSION_CREATED.value:
                         session = message["session"]
                         session["instructions"] = ""
                         session["tools"] = []
-                        session["voice"] = self.voice_choice
+                        session["voice"] = self.config.voice_choice
                         session["tool_choice"] = "none"
                         session["max_response_output_tokens"] = None
                         updated_message = json.dumps(message)
 
-                    case "response.output_item.added":
+                    case MessageType.RESPONSE_OUTPUT_ADDED.value:
                         if "item" in message and message["item"]["type"] == "function_call":
                             updated_message = None
 
-                    case "conversation.item.created":
+                    case MessageType.CONVERSATION_ITEM_CREATED.value:
                         if "item" in message and message["item"]["type"] == "function_call":
                             item = message["item"]
                             if item["call_id"] not in self._tools_pending:
@@ -110,13 +131,13 @@ class RTMiddleTier:
                         elif "item" in message and message["item"]["type"] == "function_call_output":
                             updated_message = None
 
-                    case "response.function_call_arguments.delta":
+                    case MessageType.FUNCTION_CALL_ARGS_DELTA.value:
                         updated_message = None
                     
-                    case "response.function_call_arguments.done":
+                    case MessageType.FUNCTION_CALL_ARGS_DONE.value:
                         updated_message = None
 
-                    case "response.output_item.done":
+                    case MessageType.RESPONSE_OUTPUT_DONE.value:
                         if "item" in message and message["item"]["type"] == "function_call":
                             item = message["item"]
                             tool_call = self._tools_pending[message["item"]["call_id"]]
@@ -140,7 +161,7 @@ class RTMiddleTier:
                                 })
                             updated_message = None
 
-                    case "response.done":
+                    case MessageType.RESPONSE_DONE.value:
                         if len(self._tools_pending) > 0:
                             self._tools_pending.clear()
                             await server_ws.send_json({
@@ -158,25 +179,25 @@ class RTMiddleTier:
             return updated_message
         except Exception as e:
             logger.error(f"Error processing message: {str(e)}")
-            return msg.data  # Return original message if there's an error
+            return msg.data 
 
     async def _process_message_to_server(self, msg: str, ws: web.WebSocketResponse) -> Optional[str]:
         message = json.loads(msg.data)
         updated_message = msg.data
         if message is not None:
             match message["type"]:
-                case "session.update":
+                case MessageType.SESSION_UPDATE.value:
                     session = message["session"]
-                    if self.system_message is not None:
-                        session["instructions"] = self.system_message
-                    if self.temperature is not None:
-                        session["temperature"] = self.temperature
-                    if self.max_tokens is not None:
-                        session["max_response_output_tokens"] = self.max_tokens
-                    if self.disable_audio is not None:
-                        session["disable_audio"] = self.disable_audio
-                    if self.voice_choice is not None:
-                        session["voice"] = self.voice_choice
+                    if self.config.system_message is not None:
+                        session["instructions"] = self.config.system_message
+                    if self.config.temperature is not None:
+                        session["temperature"] = self.config.temperature
+                    if self.config.max_tokens is not None:
+                        session["max_response_output_tokens"] = self.config.max_tokens
+                    if self.config.disable_audio is not None:
+                        session["disable_audio"] = self.config.disable_audio
+                    if self.config.voice_choice is not None:
+                        session["voice"] = self.config.voice_choice
                     session["tool_choice"] = "auto" if len(self.tools) > 0 else "none"
                     session["tools"] = [tool.schema for tool in self.tools.values()]
                     updated_message = json.dumps(message)
@@ -192,8 +213,8 @@ class RTMiddleTier:
     # 5. Backend: Audio responses come back from OpenAI (e.g., "response.audio.delta")
     # 6. Frontend: Audio responses are handled by useAudioPlayer component
     async def _forward_messages(self, ws: web.WebSocketResponse):
-        async with aiohttp.ClientSession(base_url=self.endpoint) as session:
-            params = { "api-version": self.api_version, "deployment": self.deployment}
+        async with aiohttp.ClientSession(base_url=self.config.endpoint) as session:
+            params = { "api-version": self.config.api_version, "deployment": self.config.deployment}
             headers = {}
             if "x-ms-client-request-id" in ws.headers:
                 headers["x-ms-client-request-id"] = ws.headers["x-ms-client-request-id"]
@@ -263,9 +284,8 @@ class RTMiddleTier:
                 disconnected.add(ws)
         
         # Clean up any disconnected clients
-        for ws in disconnected:
-            if ws in self._connected_clients:
-                self._connected_clients.remove(ws)
+        self._connected_clients.difference_update(disconnected)
     
-    def attach_to_app(self, app, path):
+    def attach_to_app(self, app: web.Application, path: str) -> None:
+        """Attach the WebSocket handler to the application."""
         app.router.add_get(path, self._websocket_handler)

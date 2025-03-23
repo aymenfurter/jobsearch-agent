@@ -1,90 +1,144 @@
-from typing import Optional, List, Dict, Any, Callable
+from dataclasses import dataclass, asdict
+from enum import Enum
 import asyncio
+from typing import Any, Callable, Dict, List, Optional, Set
+
+# View mode constants
+class ViewMode(Enum):
+    SEARCH = "search"
+    DETAIL = "detail"
+
+@dataclass
+class SearchState:
+    """State for job search results."""
+    query: Optional[str] = None
+    country: Optional[str] = None
+    results: Optional[List[Dict[str, Any]]] = None
+    total_count: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+class StateUpdateError(Exception):
+    """Raised when state update fails."""
+    pass
 
 class UIState:
-    """Manages the current state of the user interface"""
-    def __init__(self):
-        self._search_state = {
-            "query": None,
-            "country": None,
-            "results": None,
-            "total_count": 0
-        }
-        self._current_job = None
-        self._view_mode = "search"  # Can be 'search' or 'detail'
-        self._on_update_callbacks = []
+    """
+    Manages the current state of the user interface.
     
+    Attributes:
+        _search_state: Current search parameters and results
+        _current_job: Currently selected job details
+        _view_mode: Current view mode (search/detail)
+        _on_update_callbacks: Registered state change listeners
+    """
+    
+    MAX_RESULTS = 5  # Maximum number of results to store
+    
+    def __init__(self):
+        self._search_state = SearchState()
+        self._current_job: Optional[Dict[str, Any]] = None
+        self._view_mode: ViewMode = ViewMode.SEARCH
+        self._on_update_callbacks: List[Callable[[Dict[str, Any]], None]] = []
+
     @property
-    def search_state(self):
+    def search_state(self) -> SearchState:
+        """Get current search state."""
         return self._search_state
     
     @search_state.setter
-    def search_state(self, value):
-        self._search_state = value
-    
+    def search_state(self, value: Dict[str, Any]) -> None:
+        """Update search state with validation."""
+        try:
+            self._search_state = SearchState(**value)
+        except (TypeError, ValueError) as e:
+            raise StateUpdateError(f"Invalid search state: {str(e)}")
+
     @property
-    def current_job(self):
+    def current_job(self) -> Optional[Dict[str, Any]]:
+        """Get current job details."""
         return self._current_job
     
     @current_job.setter
-    def current_job(self, value):
+    def current_job(self, value: Dict[str, Any]) -> None:
+        """Update current job details."""
         self._current_job = value
-    
+
     @property
-    def view_mode(self):
-        return self._view_mode
+    def view_mode(self) -> str:
+        """Get current view mode."""
+        return self._view_mode.value
     
     @view_mode.setter
-    def view_mode(self, value):
-        if value in ["search", "detail"]:
-            self._view_mode = value
-    
-    def add_update_listener(self, callback: Callable[[Dict], None]):
-        """Add a callback to be called when state changes"""
+    def view_mode(self, value: str) -> None:
+        """Update view mode with validation."""
+        try:
+            self._view_mode = ViewMode(value)
+        except ValueError:
+            raise StateUpdateError(f"Invalid view mode: {value}")
+
+    def add_update_listener(self, callback: Callable[[Dict[str, Any]], None]) -> None:
+        """Add a callback to be called when state changes."""
         self._on_update_callbacks.append(callback)
     
-    def _notify_listeners(self):
-        """Notify all listeners of state change"""
-        state = self.get_state()
+    async def _notify_listeners_async(self, state: Dict[str, Any]) -> None:
+        """Notify async listeners of state changes."""
         for callback in self._on_update_callbacks:
             if asyncio.iscoroutinefunction(callback):
-                asyncio.create_task(callback(state))
-            else:
-                callback(state)
-    
-    def update_search(self, query: str, country: Optional[str], results: List[Dict], total_count: int):
-        """Update search results state"""
-        self._search_state = {
-            "query": query,
-            "country": country,
-            "results": results[:5],  # Only keep first 5 results
-            "total_count": total_count
-        }
-        self._view_mode = "search"
+                await callback(state)
+
+    def _notify_listeners(self) -> None:
+        """Notify all listeners of state change."""
+        state = self.get_state()
+        sync_callbacks = [cb for cb in self._on_update_callbacks 
+                         if not asyncio.iscoroutinefunction(cb)]
+        
+        # Handle synchronous callbacks
+        for callback in sync_callbacks:
+            callback(state)
+            
+        # Schedule async callbacks
+        if any(asyncio.iscoroutinefunction(cb) for cb in self._on_update_callbacks):
+            asyncio.create_task(self._notify_listeners_async(state))
+
+    def update_search(self, query: str, country: Optional[str], 
+                     results: List[Dict[str, Any]], total_count: int) -> None:
+        """
+        Update search results state.
+        
+        Args:
+            query: Search query string
+            country: Optional country filter
+            results: List of job results
+            total_count: Total number of matches
+        """
+        self._search_state = SearchState(
+            query=query,
+            country=country,
+            results=results[:self.MAX_RESULTS],
+            total_count=total_count
+        )
+        self._view_mode = ViewMode.SEARCH
         self._notify_listeners()
-    
-    def update_job_detail(self, job: Dict[str, Any]):
-        """Update the currently viewed job"""
+
+    def update_job_detail(self, job: Dict[str, Any]) -> None:
+        """Update the currently viewed job."""
         self._current_job = job
-        self._view_mode = "detail"
+        self._view_mode = ViewMode.DETAIL
         self._notify_listeners()
     
-    def reset_state(self):
-        """Reset the state to its initial values"""
-        self._search_state = {
-            "query": None,
-            "country": None,
-            "results": None,
-            "total_count": 0
-        }
+    def reset_state(self) -> None:
+        """Reset all state to initial values."""
+        self._search_state = SearchState()
         self._current_job = None
-        self._view_mode = "search"
+        self._view_mode = ViewMode.SEARCH
         self._notify_listeners()
     
-    def get_state(self) -> Dict:
-        """Get the complete UI state"""
+    def get_state(self) -> Dict[str, Any]:
+        """Get complete UI state as dictionary."""
         return {
-            "search": self._search_state,
+            "search": self._search_state.to_dict(),
             "current_job": self._current_job,
-            "view_mode": self._view_mode
+            "view_mode": self._view_mode.value
         }
