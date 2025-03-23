@@ -1,10 +1,17 @@
+/**
+ * Manages audio playback functionality using Web Audio API
+ */
 export class Player {
     private playbackNode: AudioWorkletNode | null = null;
     private audioContext: AudioContext | null = null;
     private gainNode: GainNode | null = null;
     private isMuted: boolean = false;
 
-    async init(sampleRate: number) {
+    /**
+     * Initializes the audio context and sets up the audio processing chain
+     * @param sampleRate - The sample rate for audio playback
+     */
+    async init(sampleRate: number): Promise<void> {
         this.audioContext = new AudioContext({ sampleRate });
         await this.audioContext.audioWorklet.addModule("audio-playback-worklet.js");
 
@@ -15,7 +22,11 @@ export class Player {
         this.gainNode.connect(this.audioContext.destination);
     }
 
-    play(buffer: Int16Array) {
+    /**
+     * Plays the provided audio buffer
+     * @param buffer - Audio data as Int16Array
+     */
+    play(buffer: Int16Array): void {
         if (this.playbackNode) {
             this.playbackNode.port.postMessage(buffer);
         }

@@ -3,11 +3,18 @@ import { Recorder } from "@/components/audio/recorder";
 
 const BUFFER_SIZE = 4800;
 
-type Parameters = {
+interface AudioRecorderParams {
     onAudioRecorded: (base64: string) => void;
-};
+}
 
-export default function useAudioRecorder({ onAudioRecorded }: Parameters) {
+interface AudioRecorderHook {
+    start: () => Promise<void>;
+    stop: () => Promise<void>;
+    toggleMute: () => void;
+    isMuted: boolean;
+}
+
+export default function useAudioRecorder({ onAudioRecorded }: AudioRecorderParams): AudioRecorderHook {
     const audioRecorder = useRef<Recorder>();
     const [isMuted, setIsMuted] = useState(false);
 

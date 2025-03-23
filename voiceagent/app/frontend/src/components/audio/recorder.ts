@@ -1,3 +1,6 @@
+/**
+ * Handles audio recording and processing using Web Audio API
+ */
 export class Recorder {
     onDataAvailable: (buffer: Iterable<number>) => void;
     private audioContext: AudioContext | null = null;
@@ -11,7 +14,11 @@ export class Recorder {
         this.onDataAvailable = onDataAvailable;
     }
 
-    async start(stream: MediaStream) {
+    /**
+     * Initializes and starts the audio recording process
+     * @param stream - Media stream from user's microphone
+     */
+    async start(stream: MediaStream): Promise<void> {
         try {
             if (this.audioContext) {
                 await this.audioContext.close();

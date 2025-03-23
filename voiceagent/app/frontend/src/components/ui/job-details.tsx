@@ -1,5 +1,11 @@
-import { ArrowLeft, ExternalLink } from "lucide-react";
+// UI Component imports
 import { Button } from "./button";
+import { JobSection } from "./job-section";
+
+// Icon imports
+import { ArrowLeft } from "lucide-react";
+
+// Type imports
 import { Job } from "@/types";
 
 interface JobDetailsProps {
@@ -7,12 +13,21 @@ interface JobDetailsProps {
   onBackToResults: () => void;
 }
 
-// Helper function to safely render HTML content
-const createMarkup = (htmlContent: string) => {
-  return { __html: htmlContent };
-};
+interface JobMetadataProps {
+  jobId: string;
+  location?: string;
+  employmentType?: string;
+}
 
-export function JobDetails({ job, onBackToResults }: JobDetailsProps) {
+const JobMetadata = ({ jobId, location, employmentType }: JobMetadataProps): JSX.Element => (
+  <div className="text-sm text-muted-foreground mt-2 flex flex-wrap gap-x-3 gap-y-1">
+    <span>ID: {jobId}</span>
+    {location && <span>• {location}</span>}
+    {employmentType && <span>• {employmentType}</span>}
+  </div>
+);
+
+export function JobDetails({ job, onBackToResults }: JobDetailsProps): JSX.Element {
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
@@ -22,58 +37,21 @@ export function JobDetails({ job, onBackToResults }: JobDetailsProps) {
           </Button>
           <h2 className="computer-text text-2xl">JOB DETAILS</h2>
         </div>
-        {'jobUrl' in job && job.jobUrl && (
-          <Button 
-            variant="outline" 
-            size="sm"
-            className="flex items-center gap-2"
-            onClick={() => window.open(job.jobUrl, '_blank')}
-          >
-            <span>APPLY ON MICROSOFT.COM</span>
-            <ExternalLink className="h-4 w-4" />
-          </Button>
-        )}
       </div>
 
       <div className="border border-primary/20 rounded-md p-6 space-y-6 bg-background/50">
         <div>
           <h1 className="computer-text text-2xl font-bold">{job.title}</h1>
-          <div className="text-sm text-muted-foreground mt-2 flex flex-wrap gap-x-3 gap-y-1">
-            <span>ID: {job.jobId}</span>
-            {'location' in job && job.primaryLocation && <span>• {job.primaryLocation}</span>}
-            {'employmentType' in job && job.employmentType && <span>• {job.employmentType}</span>}
-          </div>
+          <JobMetadata 
+            jobId={job.jobId}
+            location={'primaryLocation' in job ? job.primaryLocation : undefined}
+            employmentType={'employmentType' in job ? job.employmentType : undefined}
+          />
         </div>
 
-        {job.description && (
-          <div>
-            <h3 className="computer-text text-lg font-medium mb-2">DESCRIPTION</h3>
-            <div 
-              className="prose prose-sm max-w-none"
-              dangerouslySetInnerHTML={createMarkup(job.description)}
-            />
-          </div>
-        )}
-
-        {job.qualifications && (
-          <div>
-            <h3 className="computer-text text-lg font-medium mb-2">QUALIFICATIONS</h3>
-            <div 
-              className="prose prose-sm max-w-none"
-              dangerouslySetInnerHTML={createMarkup(job.qualifications)}
-            />
-          </div>
-        )}
-        
-        {job.responsibilities && (
-          <div>
-            <h3 className="computer-text text-lg font-medium mb-2">RESPONSIBILITIES</h3>
-            <div 
-              className="prose prose-sm max-w-none"
-              dangerouslySetInnerHTML={createMarkup(job.responsibilities)}
-            />
-          </div>
-        )}
+        <JobSection title="DESCRIPTION" content={job.description} />
+        <JobSection title="QUALIFICATIONS" content={job.qualifications} />
+        <JobSection title="RESPONSIBILITIES" content={job.responsibilities} />
       </div>
     </div>
   );

@@ -12,18 +12,14 @@ import {
     ResponseInputAudioTranscriptionCompleted
 } from "@/types";
 
-type Parameters = {
-    useDirectAoaiApi?: boolean; // If true, the middle tier will be skipped and the AOAI ws API will be called directly
-    aoaiEndpointOverride?: string;
-    aoaiApiKeyOverride?: string;
-    aoaiModelOverride?: string;
-
-    enableInputAudioTranscription?: boolean;
+interface WebSocketCallbacks {
     onWebSocketOpen?: () => void;
     onWebSocketClose?: () => void;
     onWebSocketError?: (event: Event) => void;
     onWebSocketMessage?: (event: MessageEvent<any>) => void;
+}
 
+interface MessageCallbacks {
     onReceivedResponseAudioDelta?: (message: ResponseAudioDelta) => void;
     onReceivedInputAudioBufferSpeechStarted?: (message: Message) => void;
     onReceivedResponseDone?: (message: ResponseDone) => void;
@@ -31,26 +27,44 @@ type Parameters = {
     onReceivedResponseAudioTranscriptDelta?: (message: ResponseAudioTranscriptDelta) => void;
     onReceivedInputAudioTranscriptionCompleted?: (message: ResponseInputAudioTranscriptionCompleted) => void;
     onReceivedError?: (message: Message) => void;
-};
+}
 
-export default function useRealTime({
-    useDirectAoaiApi,
-    aoaiEndpointOverride,
-    aoaiApiKeyOverride,
-    aoaiModelOverride,
-    enableInputAudioTranscription,
-    onWebSocketOpen,
-    onWebSocketClose,
-    onWebSocketError,
-    onWebSocketMessage,
-    onReceivedResponseDone,
-    onReceivedResponseAudioDelta,
-    onReceivedResponseAudioTranscriptDelta,
-    onReceivedInputAudioBufferSpeechStarted,
-    onReceivedExtensionMiddleTierToolResponse,
-    onReceivedInputAudioTranscriptionCompleted,
-    onReceivedError
-}: Parameters) {
+interface ConfigParameters {
+    useDirectAoaiApi?: boolean;
+    aoaiEndpointOverride?: string;
+    aoaiApiKeyOverride?: string;
+    aoaiModelOverride?: string;
+    enableInputAudioTranscription?: boolean;
+}
+
+type Parameters = ConfigParameters & WebSocketCallbacks & MessageCallbacks;
+
+interface RealtimeHook {
+    startSession: () => void;
+    addUserAudio: (base64Audio: string) => void;
+    inputAudioBufferClear: () => void;
+}
+
+export default function useRealTime(params: Parameters): RealtimeHook {
+    const {
+        useDirectAoaiApi,
+        aoaiEndpointOverride,
+        aoaiApiKeyOverride,
+        aoaiModelOverride,
+        enableInputAudioTranscription,
+        onWebSocketOpen,
+        onWebSocketClose,
+        onWebSocketError,
+        onWebSocketMessage,
+        onReceivedResponseDone,
+        onReceivedResponseAudioDelta,
+        onReceivedResponseAudioTranscriptDelta,
+        onReceivedInputAudioBufferSpeechStarted,
+        onReceivedExtensionMiddleTierToolResponse,
+        onReceivedInputAudioTranscriptionCompleted,
+        onReceivedError
+    } = params;
+
     const wsEndpoint = useDirectAoaiApi
         ? `${aoaiEndpointOverride}/openai/realtime?api-key=${aoaiApiKeyOverride}&deployment=${aoaiModelOverride}&api-version=2024-10-01-preview`
         : `/realtime`;

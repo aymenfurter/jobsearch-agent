@@ -302,7 +302,7 @@ function App() {
             </div>
 
             <footer className="mt-4 text-center text-sm text-primary/60">
-                MICROSOFT JOB SEARCH v1.0
+                JOB SEARCH v1.0
             </footer>
         </div>
     );

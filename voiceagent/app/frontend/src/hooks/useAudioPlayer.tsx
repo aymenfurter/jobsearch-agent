@@ -3,7 +3,15 @@ import { Player } from "@/components/audio/player";
 
 const SAMPLE_RATE = 24000;
 
-export default function useAudioPlayer() {
+interface AudioPlayerHook {
+    reset: () => void;
+    play: (base64Audio: string) => void;
+    stop: () => void;
+    toggleMute: () => void;
+    isMuted: boolean;
+}
+
+export default function useAudioPlayer(): AudioPlayerHook {
     const audioPlayer = useRef<Player>();
     const [isMuted, setIsMuted] = useState(false);
 

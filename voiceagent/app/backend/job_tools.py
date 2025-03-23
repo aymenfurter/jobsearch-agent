@@ -65,7 +65,6 @@ SCHEMAS = {
 async def _search_jobs(job_search: JobSearchTool, args: Dict[str, Any]) -> ToolResult:
     """Execute job search and return results."""
     result = job_search.search_jobs(args["query"], args.get("country"))
-    print(f"Search result: {result}")
     return ToolResult(result, ToolResultDirection.TO_SERVER)
 
 async def _display_job(job_search: JobSearchTool, args: Dict[str, Any]) -> ToolResult:
