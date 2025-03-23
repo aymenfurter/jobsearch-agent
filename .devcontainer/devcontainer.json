@@ -42,6 +42,5 @@
     },
     "containerEnv": {
         "PYTHONPATH": "${containerWorkspaceFolder}/src"
-    },
-    "postCreateCommand": "az --version && pip install -r requirements.txt && echo 'Azure CLI is installed and ready to use'"
+    }
 }

@@ -1,2 +1,15 @@
+# Environment variables
 .env
-*.pyc
+
+# Other common ignores
+node_modules/
+dist/
+.DS_Store
+*.log
+
+
+node_modules/
+__pycache__/
+.venv/
+static/
+.pytest_cache/
