@@ -7,9 +7,6 @@ def job_search():
     """Create a JobSearchTool instance with mocked user message for message display"""
     tool = JobSearchTool()
     # Update mock to handle three arguments (self, message, duration)
-    tool.user_message = type('MockMessage', (), {
-        'set_message': lambda x, y, z: None
-    })()
     return tool
 
 def test_search_jobs_success(job_search):

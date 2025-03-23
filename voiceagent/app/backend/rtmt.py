@@ -67,6 +67,9 @@ class RTMiddleTier:
     _tools_pending = {}
     _token_provider = None
 
+    # Add a collection to track websocket connections
+    _connected_clients = set()
+
     def __init__(self, endpoint: str, deployment: str, credentials: AzureKeyCredential | DefaultAzureCredential, voice_choice: Optional[str] = None):
         self.endpoint = endpoint
         self.deployment = deployment
@@ -231,8 +234,38 @@ class RTMiddleTier:
     async def _websocket_handler(self, request: web.Request):
         ws = web.WebSocketResponse()
         await ws.prepare(request)
-        await self._forward_messages(ws)
+        self._connected_clients.add(ws)
+        try:
+            await self._forward_messages(ws)
+        finally:
+            self._connected_clients.remove(ws)
         return ws
+    
+    async def broadcast_message(self, message_type: str, data: Any):
+        """Broadcast a message to all connected clients"""
+        if not self._connected_clients:
+            return
+            
+        message = {
+            "type": message_type,
+            "data": data
+        }
+        
+        disconnected = set()
+        for ws in self._connected_clients:
+            if ws.closed:
+                disconnected.add(ws)
+                continue
+            try:
+                await ws.send_json(message)
+            except Exception as e:
+                logger.error(f"Error sending broadcast: {str(e)}")
+                disconnected.add(ws)
+        
+        # Clean up any disconnected clients
+        for ws in disconnected:
+            if ws in self._connected_clients:
+                self._connected_clients.remove(ws)
     
     def attach_to_app(self, app, path):
         app.router.add_get(path, self._websocket_handler)

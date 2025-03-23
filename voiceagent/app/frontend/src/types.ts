@@ -73,41 +73,22 @@ export type ToolResult = {
     sources: { chunk_id: string; title: string; chunk: string }[];
 };
 
-export type Job = {
+export interface Job {
     jobId: string;
     title: string;
-    category: string;
-    roleType: string;
-    travelPercentage: string;
-    posted: {
-        internal: string | null;
-        external: string;
+    description?: string;
+    qualifications?: string;
+    responsibilities?: string;
+    employmentType?: string;
+    primaryLocation?: string;
+    jobUrl?: string;
+    properties?: {
+        [key: string]: string | number | boolean | null;
     };
-    unposted: string | null;
-    jobType: string;
-    subcategory: string;
-    employmentType: string;
-    description: string;
-    qualifications: string;
-    responsibilities: string;
-    primaryWorkLocation: {
-        city: string;
-        state: string;
-        country: string;
-    };
-    workLocations: any[];
-    educationLevel: string | null;
-    workSiteFlexibility: string;
-    jobStatus: string;
-    closedDate: string | null;
-};
+}
 
 export type JobSearchState = {
     current_job: Job | null;
     search_query: string | null;
     search_country: string | null;
-    user_message: {
-        text: string;
-        remaining_seconds: number;
-    } | null;
 };

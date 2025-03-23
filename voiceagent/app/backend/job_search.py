@@ -2,6 +2,7 @@ import json
 import requests
 from typing import Optional
 from opentelemetry import trace
+from difflib import SequenceMatcher
 
 tracer = trace.get_tracer(__name__)
 
@@ -15,7 +16,6 @@ class JobSearchTool:
         self.search_query = None
         self.search_country = None
         self.ui_state = None  # Will be set when tools are attached
-        self.user_message = None  # For status messages only
 
     def search_jobs(self, query: str, country: Optional[str] = None) -> str:
         """
@@ -65,14 +65,11 @@ class JobSearchTool:
                 self.ui_state.update_search(query, country, jobs, total_count)
                 
                 # Show status message
-                self.user_message.set_message(f"Found {total_count} jobs matching your search", 5)
-                
                 return json.dumps(data, ensure_ascii=False)
             except Exception as e:
                 span.record_exception(e)
                 span.set_attribute("error", str(e))
                 error_html = f'<div class="error">Error searching jobs: {str(e)}</div>'
-                self.user_message.set_message(error_html, 10)
                 return json.dumps({"error": str(e)})
 
     def display_job(self, job_id: str) -> str:
@@ -101,12 +98,45 @@ class JobSearchTool:
                 self.ui_state.update_job_detail(job_details)
                 
                 # Show status message
-                self.user_message.set_message(f"Displaying details for {job_details.get('title')}", 5)
                 
                 return json.dumps(job_details, ensure_ascii=False)
             except Exception as e:
                 span.record_exception(e)
                 span.set_attribute("error", str(e))
                 error_html = f'<div class="error">Error fetching job details: {str(e)}</div>'
-                self.user_message.set_message(error_html, 10)
                 return json.dumps({"error": str(e)})
+
+    def find_and_display_job(self, title: str) -> str:
+        """
+        Finds the best matching job from current search results by title and displays its details.
+        """
+        with tracer.start_as_current_span("find_and_display_job") as span:
+            span.set_attribute("search_title", title)
+            
+            # Get current search results from UI state
+            current_results = self.ui_state.search_state.get("results", [])
+            
+            if not current_results:
+                return json.dumps({"error": "No active search results. Please search for jobs first."})
+            
+            # Find best matching job using title similarity
+            best_match = None
+            highest_ratio = 0
+            
+            for job in current_results:
+                ratio = SequenceMatcher(None, title.lower(), job["title"].lower()).ratio()
+                if ratio > highest_ratio:
+                    highest_ratio = ratio
+                    best_match = job
+            
+            if not best_match or highest_ratio < 0.3:  # Minimum similarity threshold
+                return json.dumps({"error": f"No matching job found for title: {title}"})
+            
+            # Display the matched job
+            return self.display_job(best_match["jobId"])
+
+    def reset_state(self):
+        """Reset the internal state"""
+        self.current_job = None
+        self.search_query = None
+        self.search_country = None
