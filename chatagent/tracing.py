@@ -2,7 +2,6 @@ import os
 from opentelemetry import trace
 from azure.monitor.opentelemetry import configure_azure_monitor
 from azure.ai.projects.telemetry.agents import AIAgentsInstrumentor
-from contextlib import contextmanager
 
 def setup_tracing(project_client):
     """
@@ -49,16 +48,12 @@ def create_trace_span(name, tracer=None):
         return nullcontext()
 
 # Helper context manager for when no tracer is provided
-@contextmanager
-def nullcontext(enter_result=None):
-    """
-    Improved nullcontext implementation compatible with OpenTelemetry spans.
-    This allows code to work with or without a tracer being configured.
-    
-    Args:
-        enter_result: The value to return from __enter__
-        
-    Yields:
-        The enter_result value
-    """
-    yield enter_result
+class nullcontext:
+    def __init__(self, enter_result=None):
+        self.enter_result = enter_result
+
+    def __enter__(self):
+        return self.enter_result
+
+    def __exit__(self, *excinfo):
+        pass

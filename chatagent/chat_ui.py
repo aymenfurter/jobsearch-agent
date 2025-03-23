@@ -225,13 +225,12 @@ def create_chat_interface(project_client, agent, thread, tracer=None):
                                         citations.append(citation_text)
                         citations_str = "\n" + "\n".join(citations) if citations else ""
                         
-                        # Ensure we're using the proper dictionary format for Gradio Chatbot with type="messages"
-                        # If we don't have an "assistant" message or last message is not from assistant, create a new one
-                        if not conversation or not isinstance(conversation[-1], dict) or conversation[-1].get("role") != "assistant" or "metadata" in conversation[-1]:
-                            conversation.append({"role": "assistant", "content": content + citations_str})
+                        # If we don't have an "assistant" message or last message has metadata, create a new one
+                        if not conversation or conversation[-1].role != "assistant" or conversation[-1].metadata:
+                            conversation.append(ChatMessage(role="assistant", content=content + citations_str))
                         else:
                             # Append to the existing last assistant message
-                            conversation[-1]["content"] += content + citations_str
+                            conversation[-1].content += content + citations_str
                         yield conversation, ""
 
             if chat_span:
