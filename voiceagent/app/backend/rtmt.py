@@ -2,13 +2,19 @@ from dataclasses import dataclass
 import asyncio
 import json
 import logging
-from enum import Enum, auto
-from typing import Any, Callable, Dict, Optional, Set, Union
+from enum import Enum
+from typing import Any, Callable, Dict, Optional, Set, Union, TYPE_CHECKING
 
 import aiohttp
 from aiohttp import web
 from azure.core.credentials import AzureKeyCredential
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+
+# Local imports - import tool-related classes from job_tools
+from job_tools import ToolDefinition, ToolResult, ToolResultDirection
+
+if TYPE_CHECKING:
+    from app import SessionState # Avoid circular import
 
 # Configure logging
 logger = logging.getLogger("voicerag")
@@ -23,10 +29,18 @@ class MessageType(Enum):
     FUNCTION_CALL_ARGS_DONE = "response.function_call_arguments.done"
     RESPONSE_OUTPUT_DONE = "response.output_item.done"
     RESPONSE_DONE = "response.done"
-
-class ToolResultDirection(Enum):
-    TO_SERVER = auto()
-    TO_CLIENT = auto()
+    INPUT_AUDIO_BUFFER_APPEND = "input_audio_buffer.append"
+    INPUT_AUDIO_BUFFER_CLEAR = "input_audio_buffer.clear"
+    RESPONSE_CREATE = "response.create"
+    EXTENSION_MIDDLE_TIER_TOOL_RESPONSE = "extension.middle_tier_tool.response"
+    CONVERSATION_ITEM_CREATE = "conversation.item.create"
+    FUNCTION_CALL_OUTPUT = "function_call_output"
+    FUNCTION_CALL = "function_call"
+    # Add UI message types (can be strings directly too)
+    UI_RESET_STATE = "reset_state"
+    UI_MANUAL_SEARCH = "manual_search"
+    UI_SELECT_JOB = "select_job"
+    UI_VIEW_SEARCH_RESULTS = "view_search_results"
 
 @dataclass
 class RTMTConfig:
@@ -41,56 +55,23 @@ class RTMTConfig:
     disable_audio: Optional[bool] = None
     voice_choice: Optional[str] = None
 
-@dataclass
-class ToolResult:
-    """Result from a tool execution."""
-    text: str
-    destination: ToolResultDirection
-
-    def to_text(self) -> str:
-        """Convert tool result to text format."""
-        if self.text is None:
-            return ""
-        return self.text if isinstance(self.text, str) else json.dumps(self.text)
-
-class Tool:
-    """Tool definition and execution."""
-    def __init__(self, target: Callable[..., ToolResult], schema: Any):
-        self.target = target
-        self.schema = schema
-
 class RTToolCall:
-    """Represents an ongoing tool call."""
+    """Represents an ongoing tool call within a session."""
     def __init__(self, tool_call_id: str, previous_id: str):
         self.tool_call_id = tool_call_id
         self.previous_id = previous_id
 
-class WebSocketMessageHandler:
-    """Handles WebSocket message processing."""
-    @staticmethod
-    async def process_client_message(message: Dict[str, Any], session: Dict[str, Any], tools: Dict[str, Tool]) -> Optional[str]:
-        """Process messages from client to server."""
-        if message["type"] == MessageType.SESSION_UPDATE.value:
-            WebSocketMessageHandler._update_session_config(session, tools)
-            return json.dumps({"type": MessageType.SESSION_UPDATE.value, "session": session})
-        return None
-
-    @staticmethod
-    def _update_session_config(session: Dict[str, Any], tools: Dict[str, Tool]) -> None:
-        """Update session configuration with tool settings."""
-        session["tool_choice"] = "auto" if tools else "none"
-        session["tools"] = [tool.schema for tool in tools.values()]
-
 class RTMiddleTier:
-    """Real-Time Middle Tier for handling WebSocket communications."""
+    """Real-Time Middle Tier for handling WebSocket communications per session."""
     
     def __init__(self, endpoint: str, deployment: str, 
-                 credentials: Union[AzureKeyCredential, DefaultAzureCredential], 
+                 credentials: Union[AzureKeyCredential, DefaultAzureCredential],
+                 tool_definitions: Dict[str, ToolDefinition],
+                 session_provider: Callable[[str], 'SessionState'],
                  voice_choice: Optional[str] = None):
         self.config = RTMTConfig(endpoint=endpoint, deployment=deployment, voice_choice=voice_choice)
-        self.tools: Dict[str, Tool] = {}
-        self._tools_pending: Dict[str, RTToolCall] = {}
-        self._connected_clients: Set[web.WebSocketResponse] = set()
+        self.tool_definitions = tool_definitions
+        self.session_provider = session_provider
         
         if isinstance(credentials, AzureKeyCredential):
             self.key = credentials.key
@@ -103,91 +84,149 @@ class RTMiddleTier:
             )
             self._token_provider()  # Warm up token cache
 
-    async def _process_message_to_client(self, msg: str, client_ws: web.WebSocketResponse, server_ws: web.WebSocketResponse) -> Optional[str]:
+    async def _process_message_to_client(self, msg_data: str, session_id: str, client_ws: web.WebSocketResponse, server_ws: web.WebSocketResponse) -> Optional[str]:
+        """Process messages from OpenAI server to the client, handling tool calls within the session."""
         try:
-            message = json.loads(msg.data)
-            updated_message = msg.data
+            message = json.loads(msg_data)
+            session_state = self.session_provider(session_id)
+            updated_message = msg_data
+
             if message is not None:
-                match message["type"]:
-                    case MessageType.SESSION_CREATED.value:
-                        session = message["session"]
-                        session["instructions"] = ""
-                        session["tools"] = []
-                        session["voice"] = self.config.voice_choice
-                        session["tool_choice"] = "none"
-                        session["max_response_output_tokens"] = None
-                        updated_message = json.dumps(message)
+                msg_type = message.get("type")
+                
+                if msg_type == MessageType.SESSION_CREATED.value:
+                    session = message["session"]
+                    session["instructions"] = self.config.system_message or ""
+                    session["tools"] = [td.schema for td in self.tool_definitions.values()]
+                    session["voice"] = self.config.voice_choice
+                    session["tool_choice"] = "auto" if self.tool_definitions else "none"
+                    session["max_response_output_tokens"] = self.config.max_tokens
+                    updated_message = json.dumps(message)
 
-                    case MessageType.RESPONSE_OUTPUT_ADDED.value:
-                        if "item" in message and message["item"]["type"] == "function_call":
-                            updated_message = None
+                elif msg_type == MessageType.RESPONSE_OUTPUT_ADDED.value:
+                    if message.get("item", {}).get("type") == MessageType.FUNCTION_CALL.value:
+                        updated_message = None # Don't forward raw function call to client
 
-                    case MessageType.CONVERSATION_ITEM_CREATED.value:
-                        if "item" in message and message["item"]["type"] == "function_call":
-                            item = message["item"]
-                            if item["call_id"] not in self._tools_pending:
-                                self._tools_pending[item["call_id"]] = RTToolCall(item["call_id"], message["previous_item_id"])
-                            updated_message = None
-                        elif "item" in message and message["item"]["type"] == "function_call_output":
-                            updated_message = None
+                elif msg_type == MessageType.CONVERSATION_ITEM_CREATED.value:
+                    item = message.get("item", {})
+                    item_type = item.get("type")
+                    if item_type == MessageType.FUNCTION_CALL.value:
+                        call_id = item.get("call_id")
+                        if call_id and call_id not in session_state.pending_tools:
+                            session_state.pending_tools[call_id] = RTToolCall(call_id, message.get("previous_item_id"))
+                        updated_message = None # Don't forward raw function call to client
+                    elif item_type == MessageType.FUNCTION_CALL_OUTPUT.value:
+                        updated_message = None # Don't forward function call output to client
 
-                    case MessageType.FUNCTION_CALL_ARGS_DELTA.value:
-                        updated_message = None
-                    
-                    case MessageType.FUNCTION_CALL_ARGS_DONE.value:
-                        updated_message = None
+                elif msg_type == MessageType.FUNCTION_CALL_ARGS_DELTA.value:
+                    updated_message = None # Don't forward argument deltas
+                
+                elif msg_type == MessageType.FUNCTION_CALL_ARGS_DONE.value:
+                    updated_message = None # Don't forward argument done messages
 
-                    case MessageType.RESPONSE_OUTPUT_DONE.value:
-                        if "item" in message and message["item"]["type"] == "function_call":
-                            item = message["item"]
-                            tool_call = self._tools_pending[message["item"]["call_id"]]
-                            tool = self.tools[item["name"]]
-                            args = item["arguments"]
-                            result = await tool.target(json.loads(args))
-                            await server_ws.send_json({
-                                "type": "conversation.item.create",
-                                "item": {
-                                    "type": "function_call_output",
-                                    "call_id": item["call_id"],
-                                    "output": result.to_text() if result.destination == ToolResultDirection.TO_SERVER else ""
-                                }
-                            })
-                            if result.destination == ToolResultDirection.TO_CLIENT:
-                                await client_ws.send_json({
-                                    "type": "extension.middle_tier_tool_response",
-                                    "previous_item_id": tool_call.previous_id,
-                                    "tool_name": item["name"],
-                                    "tool_result": result.to_text()
-                                })
-                            updated_message = None
+                elif msg_type == MessageType.RESPONSE_OUTPUT_DONE.value:
+                    item = message.get("item", {})
+                    if item.get("type") == MessageType.FUNCTION_CALL.value:
+                        call_id = item.get("call_id")
+                        tool_name = item.get("name")
+                        args_str = item.get("arguments")
+                        
+                        if call_id and tool_name and args_str and call_id in session_state.pending_tools:
+                            tool_call = session_state.pending_tools.pop(call_id)
+                            tool_def = self.tool_definitions.get(tool_name)
+                            
+                            if tool_def:
+                                try:
+                                    args = json.loads(args_str)
+                                    # Pass the session-specific job_search instance
+                                    result = await tool_def.handler(session_state.job_search, args)
+                                    
+                                    # Send result to server (LLM)
+                                    await server_ws.send_json({
+                                        "type": MessageType.CONVERSATION_ITEM_CREATE.value,
+                                        "item": {
+                                            "type": MessageType.FUNCTION_CALL_OUTPUT.value,
+                                            "call_id": call_id,
+                                            "output": result.to_text() # Always send text result to server
+                                        }
+                                    })
+                                    
+                                    # UI updates are now handled via UIState listeners, no need to send EXTENSION_MIDDLE_TIER_TOOL_RESPONSE
+                                    # if result.destination == ToolResultDirection.TO_CLIENT:
+                                    #     await client_ws.send_json({
+                                    #         "type": MessageType.EXTENSION_MIDDLE_TIER_TOOL_RESPONSE.value,
+                                    #         "previous_item_id": tool_call.previous_id,
+                                    #         "tool_name": tool_name,
+                                    #         "tool_result": result.to_text()
+                                    #     })
+                                except json.JSONDecodeError:
+                                    logger.error(f"Session {session_id}: Failed to decode tool arguments: {args_str}")
+                                except Exception as tool_error:
+                                    logger.error(f"Session {session_id}: Error executing tool {tool_name}: {tool_error}")
+                                    # Optionally send an error back to the LLM
+                                    await server_ws.send_json({
+                                        "type": MessageType.CONVERSATION_ITEM_CREATE.value,
+                                        "item": {
+                                            "type": MessageType.FUNCTION_CALL_OUTPUT.value,
+                                            "call_id": call_id,
+                                            "output": json.dumps({"error": f"Tool execution failed: {tool_error}"})
+                                        }
+                                    })
+                            else:
+                                logger.warning(f"Session {session_id}: Received call for unknown tool: {tool_name}")
+                        
+                        updated_message = None # Don't forward the original message
 
-                    case MessageType.RESPONSE_DONE.value:
-                        if len(self._tools_pending) > 0:
-                            self._tools_pending.clear()
-                            await server_ws.send_json({
-                                "type": "response.create"
-                            })
-                        if "response" in message and "output" in message["response"]:
-                            output = message["response"]["output"]
-                            if isinstance(output, list):
-                                # Remove function calls from output safely
-                                new_output = [item for item in output if item.get("type") != "function_call"]
-                                if len(new_output) != len(output):
-                                    message["response"]["output"] = new_output
-                                    updated_message = json.dumps(message)
+                elif msg_type == MessageType.RESPONSE_DONE.value:
+                    if session_state.pending_tools:
+                        logger.warning(f"Session {session_id}: Response done, but {len(session_state.pending_tools)} tools still pending. Clearing.")
+                        session_state.pending_tools.clear()
+                        # Request a new response turn from the LLM as the previous one was likely interrupted by tool calls
+                        await server_ws.send_json({"type": MessageType.RESPONSE_CREATE.value})
+                        
+                    # Clean up function calls from the final response output if necessary
+                    response_data = message.get("response", {})
+                    output_list = response_data.get("output")
+                    if isinstance(output_list, list):
+                        original_len = len(output_list)
+                        cleaned_output = [item for item in output_list if item.get("type") != MessageType.FUNCTION_CALL.value]
+                        if len(cleaned_output) < original_len:
+                            message["response"]["output"] = cleaned_output
+                            updated_message = json.dumps(message)
 
             return updated_message
+        except json.JSONDecodeError:
+            logger.error(f"Session {session_id}: Failed to decode server message: {msg_data}")
+            return msg_data # Forward undecodable message as is
         except Exception as e:
-            logger.error(f"Error processing message: {str(e)}")
-            return msg.data 
+            logger.error(f"Session {session_id}: Error processing message to client: {str(e)}")
+            return msg_data # Forward original message on error
 
-    async def _process_message_to_server(self, msg: str, ws: web.WebSocketResponse) -> Optional[str]:
-        message = json.loads(msg.data)
-        updated_message = msg.data
-        if message is not None:
-            match message["type"]:
-                case MessageType.SESSION_UPDATE.value:
-                    session = message["session"]
+    async def _process_message_to_server(self, msg_data: str, session_id: str) -> Optional[str]:
+        """Process messages from the client to the OpenAI server for a specific session."""
+        try:
+            message = json.loads(msg_data)
+            updated_message = msg_data
+            session_state = self.session_provider(session_id)
+            
+            if message is not None:
+                msg_type = message.get("type")
+
+                # Check if it's a UI-specific message
+                ui_message_types = {
+                    MessageType.UI_RESET_STATE.value,
+                    MessageType.UI_MANUAL_SEARCH.value,
+                    MessageType.UI_SELECT_JOB.value,
+                    MessageType.UI_VIEW_SEARCH_RESULTS.value
+                }
+                if msg_type in ui_message_types:
+                    logger.info(f"Session {session_id}: Handling UI message type: {msg_type}")
+                    await session_state.handle_ui_message(message)
+                    return None # Don't forward UI messages to OpenAI
+
+                elif msg_type == MessageType.SESSION_UPDATE.value:
+                    session = message.get("session", {})
+                    # Apply RTMT configurations
                     if self.config.system_message is not None:
                         session["instructions"] = self.config.system_message
                     if self.config.temperature is not None:
@@ -198,94 +237,154 @@ class RTMiddleTier:
                         session["disable_audio"] = self.config.disable_audio
                     if self.config.voice_choice is not None:
                         session["voice"] = self.config.voice_choice
-                    session["tool_choice"] = "auto" if len(self.tools) > 0 else "none"
-                    session["tools"] = [tool.schema for tool in self.tools.values()]
+                    
+                    # Apply tool configurations
+                    session["tool_choice"] = "auto" if self.tool_definitions else "none"
+                    session["tools"] = [td.schema for td in self.tool_definitions.values()]
+                    
+                    message["session"] = session
                     updated_message = json.dumps(message)
+                
+                # Other message types (like input_audio_buffer.append) are forwarded directly
 
-        return updated_message
+            return updated_message
+        except json.JSONDecodeError:
+            logger.error(f"Session {session_id}: Failed to decode client message: {msg_data}")
+            return msg_data # Forward undecodable message
+        except Exception as e:
+            logger.error(f"Session {session_id}: Error processing message to server: {str(e)}")
+            return msg_data # Forward original message on error
 
-    # Audio flow explanation:
-    # 1. Frontend: Audio is captured in recorder.ts
-    # 2. Frontend: Audio is chunked and base64-encoded by handleAudioData
-    # 3. Frontend: Chunks are sent to server via addUserAudio using WebSocket messages
-    #             (type "input_audio_buffer.append")
-    # 4. Backend: This _forward_messages function in rtmt.py relays chunks to OpenAI realtime socket
-    # 5. Backend: Audio responses come back from OpenAI (e.g., "response.audio.delta")
-    # 6. Frontend: Audio responses are handled by useAudioPlayer component
-    async def _forward_messages(self, ws: web.WebSocketResponse):
-        async with aiohttp.ClientSession(base_url=self.config.endpoint) as session:
+    async def _forward_messages(self, client_ws: web.WebSocketResponse, session_id: str):
+        """Forward messages between a client WebSocket and the OpenAI server for a given session."""
+        logger.info(f"Starting message forwarding for session: {session_id}")
+        async with aiohttp.ClientSession(base_url=self.config.endpoint) as http_session:
             params = { "api-version": self.config.api_version, "deployment": self.config.deployment}
             headers = {}
-            if "x-ms-client-request-id" in ws.headers:
-                headers["x-ms-client-request-id"] = ws.headers["x-ms-client-request-id"]
+            if "x-ms-client-request-id" in client_ws.headers:
+                headers["x-ms-client-request-id"] = client_ws.headers["x-ms-client-request-id"]
+            
             if self.key is not None:
-                headers = { "api-key": self.key }
-            else:
-                headers = { "Authorization": f"Bearer {self._token_provider()}" } # NOTE: no async version of token provider, maybe refresh token on a timer?
-            async with session.ws_connect("/openai/realtime", headers=headers, params=params) as target_ws:
-                async def from_client_to_server():
-                    async for msg in ws:
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            new_msg = await self._process_message_to_server(msg, ws)
-                            if new_msg is not None:
-                                await target_ws.send_str(new_msg)
-                        else:
-                            print("Error: unexpected message type:", msg.type)
-                    
-                    # Means it is gracefully closed by the client then time to close the target_ws
-                    if target_ws:
-                        print("Closing OpenAI's realtime socket connection.")
-                        await target_ws.close()
-                        
-                async def from_server_to_client():
-                    async for msg in target_ws:
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            new_msg = await self._process_message_to_client(msg, ws, target_ws)
-                            if new_msg is not None:
-                                await ws.send_str(new_msg)
-                        else:
-                            print("Error: unexpected message type:", msg.type)
-
+                headers["api-key"] = self.key
+            elif self._token_provider:
                 try:
+                    # Refresh token if needed
+                    token = self._token_provider() 
+                    headers["Authorization"] = f"Bearer {token}"
+                except Exception as token_error:
+                    logger.error(f"Session {session_id}: Failed to get authorization token: {token_error}")
+                    await client_ws.close(code=aiohttp.WSCloseCode.INTERNAL_ERROR, message=b'Authorization failed')
+                    return
+            else:
+                 logger.error(f"Session {session_id}: No credentials configured.")
+                 await client_ws.close(code=aiohttp.WSCloseCode.INTERNAL_ERROR, message=b'Server misconfiguration')
+                 return
+
+            try:
+                async with http_session.ws_connect("/openai/realtime", headers=headers, params=params) as server_ws:
+                    logger.info(f"Session {session_id}: Connected to OpenAI Realtime API.")
+                    
+                    async def from_client_to_server():
+                        async for msg in client_ws:
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                processed_msg = await self._process_message_to_server(msg.data, session_id)
+                                if processed_msg is not None and not server_ws.closed:
+                                    await server_ws.send_str(processed_msg)
+                            elif msg.type == aiohttp.WSMsgType.ERROR:
+                                logger.error(f"Session {session_id}: Client WS error: {client_ws.exception()}")
+                                break
+                            elif msg.type == aiohttp.WSMsgType.CLOSED:
+                                logger.info(f"Session {session_id}: Client WS closed gracefully.")
+                                break
+                        # Client closed, close server connection
+                        if not server_ws.closed:
+                            await server_ws.close()
+                            logger.info(f"Session {session_id}: Closed OpenAI connection due to client disconnect.")
+                            
+                    async def from_server_to_client():
+                        async for msg in server_ws:
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                processed_msg = await self._process_message_to_client(msg.data, session_id, client_ws, server_ws)
+                                if processed_msg is not None and not client_ws.closed:
+                                    await client_ws.send_str(processed_msg)
+                            elif msg.type == aiohttp.WSMsgType.ERROR:
+                                logger.error(f"Session {session_id}: Server WS error: {server_ws.exception()}")
+                                break
+                            elif msg.type == aiohttp.WSMsgType.CLOSED:
+                                logger.info(f"Session {session_id}: Server WS closed gracefully.")
+                                break
+                        # Server closed, close client connection
+                        if not client_ws.closed:
+                            await client_ws.close()
+                            logger.info(f"Session {session_id}: Closed client connection due to server disconnect.")
+
+                    # Run both forwarders concurrently
                     await asyncio.gather(from_client_to_server(), from_server_to_client())
-                except ConnectionResetError:
-                    # Ignore the errors resulting from the client disconnecting the socket
-                    pass
+
+            except aiohttp.ClientConnectorError as e:
+                logger.error(f"Session {session_id}: Failed to connect to OpenAI Realtime API: {e}")
+                await client_ws.close(code=aiohttp.WSCloseCode.TRY_AGAIN_LATER, message=b'Cannot reach backend service')
+            except aiohttp.WSServerHandshakeError as e:
+                 logger.error(f"Session {session_id}: WebSocket handshake with OpenAI failed: {e.status} {e.message}")
+                 await client_ws.close(code=aiohttp.WSCloseCode.INTERNAL_ERROR, message=b'Backend connection error')
+            except Exception as e:
+                logger.error(f"Session {session_id}: Unexpected error during message forwarding: {e}", exc_info=True)
+                if not client_ws.closed:
+                    await client_ws.close(code=aiohttp.WSCloseCode.INTERNAL_ERROR, message=b'Internal server error')
+        
+        logger.info(f"Stopped message forwarding for session: {session_id}")
 
     async def _websocket_handler(self, request: web.Request):
+        """Handle incoming WebSocket connections, extract session ID, and start forwarding."""
+        session_id = request.query.get('sid')
+        if not session_id:
+            logger.warning("WebSocket connection attempt without session ID.")
+            return web.HTTPBadRequest(text="Session ID (sid) query parameter is required")
+            
+        try:
+            session_state = self.session_provider(session_id) # Get or create session
+        except KeyError:
+             logger.warning(f"WebSocket connection attempt with invalid session ID: {session_id}")
+             return web.HTTPBadRequest(text="Invalid session ID")
+
         ws = web.WebSocketResponse()
         await ws.prepare(request)
-        self._connected_clients.add(ws)
+        logger.info(f"WebSocket connection established for session: {session_id}")
+        
+        # Store the client WebSocket in the session state
+        session_state.client_ws = ws
+
+        # Define the UI state update callback
+        async def send_ui_update(state: Dict[str, Any]):
+            if not ws.closed:
+                try:
+                    await ws.send_json({"type": "ui_state_update", "data": state})
+                except ConnectionResetError:
+                    logger.warning(f"Session {session_id}: Client connection closed while sending UI update.")
+                except Exception as e:
+                    logger.error(f"Session {session_id}: Error sending UI update: {e}")
+
+        # Add the callback as a listener
+        session_state.ui_state.add_update_listener(send_ui_update)
+
+        # Send initial UI state
+        await send_ui_update(session_state.ui_state.get_state())
+
         try:
-            await self._forward_messages(ws)
+            await self._forward_messages(ws, session_id)
+        except Exception as e:
+            logger.error(f"Session {session_id}: Error in WebSocket handler: {e}", exc_info=True)
         finally:
-            self._connected_clients.remove(ws)
+            logger.info(f"WebSocket connection closed for session: {session_id}")
+            # Clean up the session (including removing the listener if UIState supports it)
+            # cleanup_session(session_id) # Assuming cleanup is handled elsewhere or on session expiry
+            session_state.client_ws = None # Clear the reference
+            # Optionally remove the listener if UIState provides a remove_listener method
+            # session_state.ui_state.remove_update_listener(send_ui_update)
+        
         return ws
-    
-    async def broadcast_message(self, message_type: str, data: Any):
-        """Broadcast a message to all connected clients"""
-        if not self._connected_clients:
-            return
-            
-        message = {
-            "type": message_type,
-            "data": data
-        }
-        
-        disconnected = set()
-        for ws in self._connected_clients:
-            if ws.closed:
-                disconnected.add(ws)
-                continue
-            try:
-                await ws.send_json(message)
-            except Exception as e:
-                logger.error(f"Error sending broadcast: {str(e)}")
-                disconnected.add(ws)
-        
-        # Clean up any disconnected clients
-        self._connected_clients.difference_update(disconnected)
     
     def attach_to_app(self, app: web.Application, path: str) -> None:
         """Attach the WebSocket handler to the application."""
+        # Ensure the path passed from app.py is used
         app.router.add_get(path, self._websocket_handler)

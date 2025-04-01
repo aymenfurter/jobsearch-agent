@@ -59,11 +59,16 @@ class JobSearchTool:
         ui_state: Reference to UI state manager
     """
     
-    def __init__(self):
+    def __init__(self, ui_state):
+        """Initialize JobSearchTool with UI state manager.
+        
+        Args:
+            ui_state: UI state manager instance for updating the interface
+        """
         self.current_job: Optional[Dict[str, Any]] = None
         self.search_query: Optional[str] = None
         self.search_country: Optional[str] = None
-        self.ui_state = None
+        self.ui_state = ui_state
 
     def _make_api_request(self, url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Make API request with error handling and telemetry."""

@@ -128,6 +128,12 @@ class UIState:
         self._view_mode = ViewMode.DETAIL
         self._notify_listeners()
     
+    def reset_view(self) -> None:
+        """Reset the view to search mode without clearing results."""
+        self._view_mode = ViewMode.SEARCH
+        self._current_job = None # Clear selected job when going back to search
+        self._notify_listeners()
+
     def reset_state(self) -> None:
         """Reset all state to initial values."""
         self._search_state = SearchState()

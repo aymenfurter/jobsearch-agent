@@ -1,4 +1,4 @@
-import useWebSocket from "react-use-websocket";
+import { useCallback } from "react";
 
 import {
     InputAudioBufferAppendCommand,
@@ -12,13 +12,6 @@ import {
     ResponseInputAudioTranscriptionCompleted
 } from "@/types";
 
-interface WebSocketCallbacks {
-    onWebSocketOpen?: () => void;
-    onWebSocketClose?: () => void;
-    onWebSocketError?: (event: Event) => void;
-    onWebSocketMessage?: (event: MessageEvent<any>) => void;
-}
-
 interface MessageCallbacks {
     onReceivedResponseAudioDelta?: (message: ResponseAudioDelta) => void;
     onReceivedInputAudioBufferSpeechStarted?: (message: Message) => void;
@@ -30,32 +23,25 @@ interface MessageCallbacks {
 }
 
 interface ConfigParameters {
-    useDirectAoaiApi?: boolean;
-    aoaiEndpointOverride?: string;
-    aoaiApiKeyOverride?: string;
-    aoaiModelOverride?: string;
     enableInputAudioTranscription?: boolean;
+    sessionId?: string;  // Keep session ID if needed for logic
+    sendMessage: (message: any) => boolean; // Accept sendMessage function
 }
 
-type Parameters = ConfigParameters & WebSocketCallbacks & MessageCallbacks;
+type Parameters = ConfigParameters & MessageCallbacks;
 
 interface RealtimeHook {
     startSession: () => void;
     addUserAudio: (base64Audio: string) => void;
     inputAudioBufferClear: () => void;
+    // Add a function to handle incoming messages
+    handleIncomingMessage: (message: any) => void; 
 }
 
 export default function useRealTime(params: Parameters): RealtimeHook {
     const {
-        useDirectAoaiApi,
-        aoaiEndpointOverride,
-        aoaiApiKeyOverride,
-        aoaiModelOverride,
         enableInputAudioTranscription,
-        onWebSocketOpen,
-        onWebSocketClose,
-        onWebSocketError,
-        onWebSocketMessage,
+        sendMessage, // Use provided sendMessage
         onReceivedResponseDone,
         onReceivedResponseAudioDelta,
         onReceivedResponseAudioTranscriptDelta,
@@ -65,19 +51,7 @@ export default function useRealTime(params: Parameters): RealtimeHook {
         onReceivedError
     } = params;
 
-    const wsEndpoint = useDirectAoaiApi
-        ? `${aoaiEndpointOverride}/openai/realtime?api-key=${aoaiApiKeyOverride}&deployment=${aoaiModelOverride}&api-version=2024-10-01-preview`
-        : `/realtime`;
-
-    const { sendJsonMessage } = useWebSocket(wsEndpoint, {
-        onOpen: () => onWebSocketOpen?.(),
-        onClose: () => onWebSocketClose?.(),
-        onError: event => onWebSocketError?.(event),
-        onMessage: event => onMessageReceived(event),
-        shouldReconnect: () => true
-    });
-
-    const startSession = () => {
+    const startSession = useCallback(() => {
         const command: SessionUpdateCommand = {
             type: "session.update",
             session: {
@@ -93,37 +67,28 @@ export default function useRealTime(params: Parameters): RealtimeHook {
             };
         }
 
-        sendJsonMessage(command);
-    };
+        sendMessage(command);
+    }, [sendMessage, enableInputAudioTranscription]);
 
-    const addUserAudio = (base64Audio: string) => {
+    const addUserAudio = useCallback((base64Audio: string) => {
         const command: InputAudioBufferAppendCommand = {
             type: "input_audio_buffer.append",
             audio: base64Audio
         };
 
-        sendJsonMessage(command);
-    };
+        sendMessage(command);
+    }, [sendMessage]);
 
-    const inputAudioBufferClear = () => {
+    const inputAudioBufferClear = useCallback(() => {
         const command: InputAudioBufferClearCommand = {
             type: "input_audio_buffer.clear"
         };
 
-        sendJsonMessage(command);
-    };
+        sendMessage(command);
+    }, [sendMessage]);
 
-    const onMessageReceived = (event: MessageEvent<any>) => {
-        onWebSocketMessage?.(event);
-
-        let message: Message;
-        try {
-            message = JSON.parse(event.data);
-        } catch (e) {
-            console.error("Failed to parse JSON message:", e);
-            throw e;
-        }
-
+    const handleIncomingMessage = useCallback((message: any) => {
+        // No need to parse again, assume message is already parsed JSON from useWebSocket
         switch (message.type) {
             case "response.done":
                 onReceivedResponseDone?.(message as ResponseDone);
@@ -140,14 +105,27 @@ export default function useRealTime(params: Parameters): RealtimeHook {
             case "conversation.item.input_audio_transcription.completed":
                 onReceivedInputAudioTranscriptionCompleted?.(message as ResponseInputAudioTranscriptionCompleted);
                 break;
-            case "extension.middle_tier_tool_response":
+            case "extension.middle_tier_tool.response":
+                // Note: This might be redundant if UI updates are handled by UIState
                 onReceivedExtensionMiddleTierToolResponse?.(message as ExtensionMiddleTierToolResponse);
                 break;
             case "error":
                 onReceivedError?.(message);
                 break;
+            // Add default case or logging for unhandled message types if needed
+            default:
+                // console.log('useRealTime received unhandled message type:', message.type);
+                break;
         }
-    };
+    }, [
+        onReceivedResponseDone,
+        onReceivedResponseAudioDelta,
+        onReceivedResponseAudioTranscriptDelta,
+        onReceivedInputAudioBufferSpeechStarted,
+        onReceivedExtensionMiddleTierToolResponse,
+        onReceivedInputAudioTranscriptionCompleted,
+        onReceivedError
+    ]);
 
-    return { startSession, addUserAudio, inputAudioBufferClear };
+    return { startSession, addUserAudio, inputAudioBufferClear, handleIncomingMessage };
 }

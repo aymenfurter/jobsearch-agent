@@ -4,10 +4,30 @@ This module provides the integration between the RTMiddleTier and JobSearchTool.
 """
 
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional, TypeVar, Tuple
+from enum import Enum, auto
+import json
+from typing import Any, Callable, Dict, Optional, TypeVar, Tuple, List
 
-from rtmt import RTMiddleTier, Tool, ToolResult, ToolResultDirection
+# Local imports
 from job_search import JobSearchTool
+
+# Define ToolResultDirection and ToolResult here
+class ToolResultDirection(Enum):
+    """Direction to send tool execution results."""
+    TO_SERVER = auto()  # Results go to the LLM
+    TO_CLIENT = auto()  # Results go to the client UI
+
+@dataclass
+class ToolResult:
+    """Result from a tool execution."""
+    text: str
+    destination: ToolResultDirection
+
+    def to_text(self) -> str:
+        """Convert tool result to text format."""
+        if self.text is None:
+            return ""
+        return self.text if isinstance(self.text, str) else json.dumps(self.text)
 
 # Type definitions
 ToolFunc = Callable[[JobSearchTool, Dict[str, Any]], ToolResult]
@@ -21,6 +41,7 @@ class ToolDefinition:
     handler: ToolFunc
     name: str
     description: str
+
 
 # Schema definitions
 SCHEMAS = {
@@ -65,11 +86,13 @@ SCHEMAS = {
 async def _search_jobs(job_search: JobSearchTool, args: Dict[str, Any]) -> ToolResult:
     """Execute job search and return results."""
     result = job_search.search_jobs(args["query"], args.get("country"))
+    # Result goes to server (LLM) to inform the user, not directly to client UI
     return ToolResult(result, ToolResultDirection.TO_SERVER)
 
 async def _display_job(job_search: JobSearchTool, args: Dict[str, Any]) -> ToolResult:
     """Display specific job details based on title match."""
     result = job_search.find_and_display_job(args["title"])
+    # Result goes to server (LLM) to inform the user, not directly to client UI
     return ToolResult(result, ToolResultDirection.TO_SERVER)
 
 # Tool configuration mapping
@@ -88,16 +111,6 @@ TOOL_DEFINITIONS = {
     )
 }
 
-def attach_job_tools(rtmt: RTMiddleTier, job_search: JobSearchTool) -> None:
-    """
-    Attach all job search tools to the RTMiddleTier instance.
-    
-    Args:
-        rtmt: The real-time middle tier instance
-        job_search: The job search tool instance
-    """
-    for tool_def in TOOL_DEFINITIONS.values():
-        rtmt.tools[tool_def.name] = Tool(
-            schema=tool_def.schema,
-            target=lambda args, f=tool_def.handler: f(job_search, args)
-        )
+def get_tool_definitions() -> Dict[str, ToolDefinition]:
+    """Return the dictionary of tool definitions."""
+    return TOOL_DEFINITIONS

@@ -87,8 +87,17 @@ export interface Job {
     };
 }
 
-export type JobSearchState = {
+// Define SearchState based on backend ui_state.py
+export interface SearchState {
+    query: string | null;
+    country: string | null;
+    results: Job[] | null; // Use the Job interface here
+    total_count: number;
+}
+
+// Define UIState based on backend ui_state.py
+export interface UIState {
+    search: SearchState;
     current_job: Job | null;
-    search_query: string | null;
-    search_country: string | null;
-};
+    view_mode: 'search' | 'detail';
+}
