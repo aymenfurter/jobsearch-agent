@@ -63,7 +63,7 @@ python app.py
 # Terminal 2 - Start second instance (random port)
 cd voiceagent/app/backend
 python app.py
-
+```
 You can now connect to any of these instances, and your session data will be shared across them through Redis.
 
 ## Load Balancing
