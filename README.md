@@ -1,30 +1,161 @@
-# Load Balancing for Azure OpenAI Realtime API Calls
+# Job Search Agent with Redis Scalability
 
-## Overview
+This application provides a conversational job search interface using Azure OpenAI services with Redis-powered distributed session management.
 
-Realtime API calls are inherently "sticky" - the WebSocket connections remain open once established. The most effective approach within Azure API Management (APIM) is to round-robin distribute new connection requests.
+## Prerequisites
 
-## Implementation Details
+- Docker
+- Python 3.8+
+- Node.js 14+ (for frontend)
+- Azure OpenAI API access
 
-This repository demonstrates how APIM can be used to load balance across different Azure OpenAI models and endpoints. The implementation is inspired by the [AI Hub Gateway Solution Accelerator](https://github.com/Azure-Samples/ai-hub-gateway-solution-accelerator), which includes configuration for the Azure OpenAI Realtime API.
+## Redis Setup
 
-The load balancing policy in this repository (`load_balancing_policy.xml`) distributes incoming WebSocket connections across multiple Azure OpenAI endpoints to achieve greater total throughput.
+The application uses Redis for distributed session storage, allowing multiple instances to share state. To start a Redis container locally:
 
-## How It Works
+```bash
+# Start Redis container on default port (6379) with persistence
+docker run --name redis-jobsearch \
+  -p 6379:6379 \
+  -v redis-data:/data \
+  -d redis:alpine \
+  redis-server --appendonly yes
 
-The policy uses a hashing algorithm based on the request ID to deterministically route new connections to one of the available backends:
+# Verify Redis is running
+docker ps | grep redis-jobsearch
+```
 
-1. Each incoming request is assigned a hash value based on the request ID
-2. The request is directed to one of the available Azure OpenAI endpoints based on this hash
-3. Backend-specific configuration (endpoint URI and API key) is applied
-4. The connection is established to the selected backend
+### Redis Configuration Options
 
-## Considerations
+You can configure the Redis connection using environment variables:
 
-- This approach balances the number of new socket connections rather than the workload itself
-- Client-side load balancing is an alternative approach that may be suitable for some scenarios
-- For maximum effectiveness, consider combining this with other scaling strategies
+- `REDIS_URL`: Redis connection string (default: `redis://localhost:6379/0`)
+- `SESSION_EXPIRY_SECONDS`: Session timeout in seconds (default: `86400` - 24 hours)
+- `SESSION_CLEANUP_INTERVAL_SECONDS`: Cleanup interval in seconds (default: `3600` - 1 hour)
 
-## Implementation Example
+## Application Setup
 
-See the `load_balancing_policy.xml` file for the complete APIM policy implementation.
+1. Install dependencies
+
+```bash
+cd voiceagent/app
+pip install -r requirements.txt
+```
+
+2. Configure environment variables (create a `.env` file in the `voiceagent/app/backend` directory):
+
+```
+AZURE_OPENAI_ENDPOINT=https://your-azure-openai-endpoint.com/
+AZURE_OPENAI_API_KEY=your_api_key
+AZURE_OPENAI_REALTIME_DEPLOYMENT=your_deployment_name
+REDIS_URL=redis://localhost:6379/0
+```
+
+## Running Multiple Instances
+
+For horizontal scaling, you can run multiple instances of the application that share state via Redis:
+
+```bash
+# Terminal 1 - Start first instance (default port)
+cd voiceagent/app/backend
+python app.py
+
+# Terminal 2 - Start second instance (custom port)
+cd voiceagent/app/backend
+PORT=8767 python app.py
+
+# Terminal 3 - Start third instance (custom port)
+cd voiceagent/app/backend
+PORT=8768 python app.py
+```
+
+You can now connect to any of these instances, and your session data will be shared across them through Redis.
+
+## Load Balancing (Optional)
+
+For production environments, consider placing a load balancer in front of your application instances:
+
+```bash
+# Example with Nginx in Docker (basic configuration)
+docker run --name jobsearch-lb \
+  -p 80:80 \
+  -v /path/to/nginx.conf:/etc/nginx/nginx.conf:ro \
+  -d nginx:alpine
+```
+
+Example `nginx.conf` for load balancing:
+
+```nginx
+http {
+    upstream jobsearch {
+        server localhost:8766;
+        server localhost:8767;
+        server localhost:8768;
+    }
+    
+    server {
+        listen 80;
+        
+        location / {
+            proxy_pass http://jobsearch;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+        }
+    }
+}
+```
+
+## Troubleshooting
+
+### Redis Connection Issues
+
+If the application fails to connect to Redis:
+
+1. Check if Redis container is running:
+   ```bash
+   docker ps | grep redis-jobsearch
+   ```
+
+2. If stopped, restart it:
+   ```bash
+   docker start redis-jobsearch
+   ```
+
+3. Test Redis connection:
+   ```bash
+   docker exec -it redis-jobsearch redis-cli ping
+   ```
+   Should return "PONG"
+
+### Viewing Redis Data
+
+To inspect sessions stored in Redis:
+
+```bash
+# Connect to Redis CLI
+docker exec -it redis-jobsearch redis-cli
+
+# List all job search session keys
+KEYS jobsearch:session:*
+
+# Get info on active sessions
+SMEMBERS jobsearch:active_sessions
+
+# Get details for a specific session (returns binary pickle data)
+GET jobsearch:session:[session-id]
+```
+
+## Architecture
+
+The application uses a multi-tier architecture:
+
+1. **Frontend**: React-based UI with WebSocket communication
+2. **Backend**: Python/aiohttp WebSocket server with Azure OpenAI integration
+3. **Session Store**: Redis for distributed session management
+4. **External API**: Microsoft Careers API for job data
+
+When deployed with multiple instances, each instance connects to the same Redis instance, allowing users to be served by any available backend server without losing session state.

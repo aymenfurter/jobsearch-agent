@@ -1,6 +1,7 @@
 from dataclasses import dataclass, asdict
 from enum import Enum
 import asyncio
+import json
 from typing import Any, Callable, Dict, List, Optional, Set
 
 # View mode constants
@@ -148,3 +149,32 @@ class UIState:
             "current_job": self._current_job,
             "view_mode": self._view_mode.value
         }
+        
+    def set_state_from_dict(self, state: Dict[str, Any]) -> None:
+        """
+        Restore UI state from a dictionary (for Redis loading).
+        
+        Args:
+            state: Dictionary containing the state to restore
+        """
+        if "search" in state:
+            search_data = state["search"]
+            # Handle case where results might be None but the rest is valid
+            if search_data.get("query"):
+                results = search_data.get("results") or []
+                self._search_state = SearchState(
+                    query=search_data.get("query"),
+                    country=search_data.get("country"),
+                    results=results,
+                    total_count=search_data.get("total_count", 0)
+                )
+        
+        if "current_job" in state and state["current_job"]:
+            self._current_job = state["current_job"]
+            
+        if "view_mode" in state:
+            try:
+                self._view_mode = ViewMode(state["view_mode"])
+            except ValueError:
+                # Default to search view if invalid
+                self._view_mode = ViewMode.SEARCH

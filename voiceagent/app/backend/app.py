@@ -7,7 +7,7 @@ import random
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, Optional, Set, ClassVar
 
 # Third-party imports
 from aiohttp import web
@@ -16,10 +16,11 @@ from azure.identity import AzureDeveloperCliCredential, DefaultAzureCredential
 from dotenv import load_dotenv
 
 # Local imports
-from rtmt import RTMiddleTier, RTToolCall # Assuming RTToolCall is defined in rtmt
+from rtmt import RTMiddleTier, RTToolCall
 from job_search import JobSearchTool
 from job_tools import get_tool_definitions, ToolDefinition
 from ui_state import UIState, ViewMode
+from redis_session import RedisSessionManager
 
 # Constants
 HOST = "localhost"
@@ -41,8 +42,11 @@ class SessionState:
     session_id: str
     ui_state: UIState = field(default_factory=UIState)
     job_search: Optional[JobSearchTool] = None
-    client_ws: Optional[web.WebSocketResponse] = None # Renamed from state_ws, now holds the main client WS
+    client_ws: Optional[web.WebSocketResponse] = None
     pending_tools: Dict[str, RTToolCall] = field(default_factory=dict)
+    
+    # Class variable to store the Redis session manager
+    redis_manager: ClassVar[Optional[RedisSessionManager]] = None
 
     def __post_init__(self):
         # Initialize JobSearchTool after UIState is created
@@ -70,9 +74,85 @@ class SessionState:
             # Add other UI message types here if needed
             else:
                 logger.warning(f"Session {self.session_id}: Received unknown UI message type: {message_type}")
+            
+            # After handling a message, persist state to Redis
+            self.save_to_redis()
         except Exception as e:
             logger.error(f"Session {self.session_id}: Error processing UI message '{message_type}': {e}")
 
+    def save_to_redis(self) -> None:
+        """Serialize and save session state to Redis."""
+        if not self.redis_manager:
+            logger.warning(f"Session {self.session_id}: Cannot save to Redis - no manager configured")
+            return
+            
+        try:
+            # Create serializable session data
+            session_data = {
+                'session_id': self.session_id,
+                'ui_state_data': self.ui_state.get_state(),
+                'job_search_data': {
+                    'current_job': self.job_search.current_job if self.job_search else None,
+                    'search_query': self.job_search.search_query if self.job_search else None,
+                    'search_country': self.job_search.search_country if self.job_search else None,
+                },
+                # We don't serialize pending_tools as they are ephemeral and client_ws which can't be serialized
+                'pending_tools': {},  # Only keys stored, not actual tool call objects
+                'last_activity': time.time(),
+            }
+            
+            # Store pending tool IDs (not objects)
+            if self.pending_tools:
+                session_data['pending_tools'] = {k: True for k in self.pending_tools.keys()}
+                
+            # Save to Redis
+            self.redis_manager.save_session(self.session_id, session_data)
+        except Exception as e:
+            logger.error(f"Session {self.session_id}: Failed to save to Redis: {e}")
+
+    @classmethod
+    def load_from_redis(cls, session_id: str) -> Optional['SessionState']:
+        """
+        Reconstruct session state from Redis data.
+        
+        Args:
+            session_id: Session identifier
+            
+        Returns:
+            Reconstructed SessionState object or None if not found
+        """
+        if not cls.redis_manager:
+            logger.warning(f"Cannot load session {session_id} - no Redis manager configured")
+            return None
+            
+        try:
+            # Get raw data from Redis
+            session_data = cls.redis_manager.get_session(session_id, create_if_missing=False)
+            if not session_data:
+                logger.info(f"No session data found in Redis for session {session_id}")
+                return None
+                
+            # Create new SessionState
+            session = cls(session_id=session_id)
+            
+            # Restore UI state using the new set_state_from_dict method
+            if ui_state_data := session_data.get('ui_state_data'):
+                session.ui_state.set_state_from_dict(ui_state_data)
+            
+            # Restore JobSearchTool state
+            if job_search_data := session_data.get('job_search_data'):
+                if job_search_data.get('current_job'):
+                    session.job_search.current_job = job_search_data.get('current_job')
+                if job_search_data.get('search_query'):
+                    session.job_search.search_query = job_search_data.get('search_query')
+                if 'search_country' in job_search_data:
+                    session.job_search.search_country = job_search_data.get('search_country')
+            
+            logger.info(f"Successfully restored session {session_id} from Redis")
+            return session
+        except Exception as e:
+            logger.error(f"Failed to load session {session_id} from Redis: {e}", exc_info=True)
+            return None
 
     async def handle_manual_search(self, data: Dict[str, Any]) -> None:
         """Handle manual job search requests."""
@@ -100,32 +180,113 @@ class SessionState:
              self.ui_state.view_mode = ViewMode.SEARCH.value
              self.ui_state._notify_listeners() # Manually notify if reset_view doesn't exist
 
+# Initialize Redis session manager
+session_manager = None
 
-# Global session management
-SESSIONS: Dict[str, SessionState] = {}
+# Import time here to avoid circular imports
+import time
 
 def get_or_create_session(session_id: str) -> SessionState:
-    """Retrieves an existing session or creates a new one."""
-    if session_id not in SESSIONS:
-        logger.info(f"Creating new session: {session_id}")
-        SESSIONS[session_id] = SessionState(session_id=session_id)
-    return SESSIONS[session_id]
+    """Retrieves an existing session or creates a new one using Redis."""
+    global session_manager
+    
+    # First, check if we have the session already loaded in memory
+    session = _get_memory_cached_session(session_id)
+    if session:
+        return session
+        
+    # Try to load from Redis
+    redis_session = SessionState.load_from_redis(session_id)
+    if redis_session:
+        # Cache in memory for faster access
+        _cache_session(redis_session)
+        return redis_session
+        
+    # Create a new session
+    logger.info(f"Creating new session: {session_id}")
+    new_session = SessionState(session_id=session_id)
+    _cache_session(new_session)
+    new_session.save_to_redis()
+    return new_session
+
+# Memory cache for active sessions (for performance)
+# This is just a performance optimization; Redis is the source of truth
+_MEMORY_CACHE: Dict[str, SessionState] = {}
+
+def _get_memory_cached_session(session_id: str) -> Optional[SessionState]:
+    """Get a session from the memory cache if available."""
+    return _MEMORY_CACHE.get(session_id)
+
+def _cache_session(session: SessionState) -> None:
+    """Add a session to the memory cache."""
+    _MEMORY_CACHE[session.session_id] = session
 
 def cleanup_session(session_id: str) -> None:
-    """Removes a session when it's no longer needed."""
-    if session_id in SESSIONS:
-        logger.info(f"Cleaning up session: {session_id}")
+    """Removes a session both from memory cache and Redis."""
+    global session_manager
+    
+    if session_id in _MEMORY_CACHE:
+        logger.info(f"Cleaning up session from memory cache: {session_id}")
         # Close the client WebSocket if it's still open
-        if SESSIONS[session_id].client_ws and not SESSIONS[session_id].client_ws.closed:
-            asyncio.create_task(SESSIONS[session_id].client_ws.close())
-        del SESSIONS[session_id]
+        if _MEMORY_CACHE[session_id].client_ws and not _MEMORY_CACHE[session_id].client_ws.closed:
+            asyncio.create_task(_MEMORY_CACHE[session_id].client_ws.close())
+        del _MEMORY_CACHE[session_id]
+    
+    # Also remove from Redis (if manager is available)
+    if session_manager:
+        logger.info(f"Removing session from Redis: {session_id}")
+        session_manager.delete_session(session_id)
+
+async def periodic_session_cleanup(interval: int = 3600):
+    """
+    Periodically cleans up expired sessions from Redis.
+    
+    Args:
+        interval: Cleanup interval in seconds (default: 1 hour)
+    """
+    global session_manager
+    
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            if session_manager:
+                logger.info("Running periodic Redis session cleanup...")
+                removed = await session_manager.cleanup_expired_sessions()
+                logger.info(f"Removed {removed} expired sessions from Redis")
+                
+                # Also clean memory cache of expired sessions
+                # This matches what's in Redis after cleanup
+                active_sessions = session_manager.get_active_sessions()
+                expired = set(_MEMORY_CACHE.keys()) - set(active_sessions)
+                for sid in expired:
+                    if sid in _MEMORY_CACHE:
+                        del _MEMORY_CACHE[sid]
+                logger.info(f"Removed {len(expired)} expired sessions from memory cache")
+        except Exception as e:
+            logger.error(f"Error during periodic session cleanup: {e}")
 
 async def create_app() -> web.Application:
     """Create and configure the web application."""
+    global session_manager
+    
     if not os.environ.get("RUNNING_IN_PRODUCTION"):
         logger.info("Running in development mode, loading from .env file")
         load_dotenv()
 
+    # Configure Redis
+    redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+    session_expiry = int(os.environ.get("SESSION_EXPIRY_SECONDS", "86400"))
+    
+    # Initialize Redis session manager
+    try:
+        session_manager = RedisSessionManager(redis_url=redis_url, expiry_seconds=session_expiry)
+        # Make available to SessionState class
+        SessionState.redis_manager = session_manager
+        logger.info(f"Connected to Redis at {redis_url}")
+    except Exception as e:
+        logger.error(f"Failed to connect to Redis: {e}")
+        logger.warning("Falling back to in-memory session storage only")
+        
     llm_credential = _get_credentials()
     app = web.Application()
     
@@ -144,19 +305,12 @@ async def create_app() -> web.Application:
 
     _setup_routes(app, rtmt)
 
-    # Add session cleanup task (optional, adjust frequency as needed)
-    # asyncio.create_task(periodic_session_cleanup(interval=300)) # e.g., every 5 minutes
+    # Start session cleanup task if Redis is available
+    if session_manager:
+        cleanup_interval = int(os.environ.get("SESSION_CLEANUP_INTERVAL_SECONDS", "3600"))
+        asyncio.create_task(periodic_session_cleanup(interval=cleanup_interval))
 
     return app
-
-# async def periodic_session_cleanup(interval: int):
-#     """Periodically cleans up inactive sessions."""
-#     while True:
-#         await asyncio.sleep(interval)
-#         # Add logic here to identify and cleanup inactive sessions
-#         # For example, check last activity time stored in SessionState
-#         logger.info("Running periodic session cleanup...")
-#         # ... cleanup logic ...
 
 def _get_credentials() -> AzureKeyCredential | DefaultAzureCredential:
     """Get Azure credentials based on environment configuration."""
@@ -174,9 +328,57 @@ def _setup_routes(app: web.Application, rtmt: RTMiddleTier) -> None:
     current_directory = Path(__file__).parent
     
     # Add route for generating session ID
-    app.router.add_get('/api/session/init', lambda _: web.json_response({"session_id": str(uuid.uuid4())}))
+    async def init_session(request):
+        """Initialize a new session and return the ID."""
+        if session_manager:
+            new_id = session_manager.generate_session_id()
+            # Pre-create the session in Redis
+            session_manager.get_session(new_id)
+        else:
+            new_id = str(uuid.uuid4())
+        return web.json_response({"session_id": new_id})
+        
+    app.router.add_get('/api/session/init', init_session)
     
-    # Realtime WebSocket (requires session ID) - Updated path
+    # Add route for listing all active sessions from Redis
+    async def list_sessions(request):
+        """Get all active sessions from Redis."""
+        if not session_manager:
+            return web.json_response({"sessions": []})
+        
+        try:
+            # Get active sessions from Redis
+            session_ids = session_manager.get_active_sessions()
+            sessions = []
+            
+            for sid in session_ids:
+                session_data = session_manager.get_session(sid, create_if_missing=False)
+                if session_data:
+                    # Extract basic info about each session
+                    created_at = session_data.get('created_at', 0)
+                    last_activity = session_data.get('last_activity', 0)
+                    search_query = None
+                    
+                    # Try to extract the current search query if available
+                    if ui_state_data := session_data.get('ui_state_data'):
+                        if search_data := ui_state_data.get('search'):
+                            search_query = search_data.get('query')
+                    
+                    sessions.append({
+                        "id": sid,
+                        "created_at": created_at,
+                        "last_activity": last_activity,
+                        "search_query": search_query
+                    })
+            
+            return web.json_response({"sessions": sessions})
+        except Exception as e:
+            logger.error(f"Error listing sessions: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+    
+    app.router.add_get('/api/sessions', list_sessions)
+    
+    # Realtime WebSocket (requires session ID)
     rtmt.attach_to_app(app, "/api/ws")
     
     # Static files

@@ -353,6 +353,10 @@ class RTMiddleTier:
         
         # Store the client WebSocket in the session state
         session_state.client_ws = ws
+        
+        # Save session state to Redis if available
+        if hasattr(session_state, 'save_to_redis'):
+            session_state.save_to_redis()
 
         # Define the UI state update callback
         async def send_ui_update(state: Dict[str, Any]):
@@ -376,11 +380,11 @@ class RTMiddleTier:
             logger.error(f"Session {session_id}: Error in WebSocket handler: {e}", exc_info=True)
         finally:
             logger.info(f"WebSocket connection closed for session: {session_id}")
-            # Clean up the session (including removing the listener if UIState supports it)
-            # cleanup_session(session_id) # Assuming cleanup is handled elsewhere or on session expiry
-            session_state.client_ws = None # Clear the reference
-            # Optionally remove the listener if UIState provides a remove_listener method
-            # session_state.ui_state.remove_update_listener(send_ui_update)
+            # Mark client_ws as None for this session
+            session_state.client_ws = None
+            # Save the final state to Redis
+            if hasattr(session_state, 'save_to_redis'):
+                session_state.save_to_redis()
         
         return ws
     

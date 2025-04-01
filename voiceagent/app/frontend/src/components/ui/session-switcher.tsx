@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Check, ChevronDown, Edit2, Plus, Trash2, UserCircle } from 'lucide-react';
 import { Button } from './button';
 import { StoredSession, getSavedSessions, removeSession, updateSession } from '@/utils/sessions';
@@ -21,13 +21,36 @@ export function SessionSwitcher({
   const [sessions, setSessions] = useState<StoredSession[]>([]);
   const [editingSession, setEditingSession] = useState<string | null>(null);
   const [sessionName, setSessionName] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
   const dropdownRef = useRef<HTMLDivElement>(null);
   const editInputRef = useRef<HTMLInputElement>(null);
   
-  // Load sessions from localStorage
-  useEffect(() => {
-    setSessions(getSavedSessions());
+  // Load sessions from localStorage and Redis when needed
+  const refreshSessions = useCallback(async () => {
+    setIsLoading(true);
+    try {
+      const savedSessions = await getSavedSessions();
+      // Sort by last used timestamp (most recent first)
+      savedSessions.sort((a: StoredSession, b: StoredSession) => b.lastUsed - a.lastUsed);
+      setSessions(savedSessions);
+    } catch (error) {
+      console.error("Error loading sessions:", error);
+    } finally {
+      setIsLoading(false);
+    }
   }, []);
+
+  // Refresh when dropdown opens or current session changes
+  useEffect(() => {
+    if (isOpen || currentSessionId) {
+      refreshSessions();
+    }
+  }, [isOpen, currentSessionId, refreshSessions]);
+  
+  // Also refresh on mount
+  useEffect(() => {
+    refreshSessions();
+  }, [refreshSessions]);
   
   // Handle clicks outside the dropdown to close it
   useEffect(() => {
@@ -69,7 +92,7 @@ export function SessionSwitcher({
     if (sessionName.trim()) {
       const updatedSession = updateSession(sessionId, { name: sessionName.trim() });
       if (updatedSession) {
-        setSessions(getSavedSessions());
+        refreshSessions();
         setEditingSession(null);
       }
     }
@@ -78,7 +101,7 @@ export function SessionSwitcher({
   // Handle session deletion
   const handleDeleteSession = (sessionId: string) => {
     removeSession(sessionId);
-    setSessions(getSavedSessions());
+    refreshSessions();
     
     // If we're deleting the current session, create a new one
     if (sessionId === currentSessionId) {
@@ -96,6 +119,7 @@ export function SessionSwitcher({
   const handleCreateSession = async () => {
     setIsOpen(false);
     onCreateNewSession();
+    // Will refresh via currentSessionId change
   };
 
   return (
@@ -117,7 +141,11 @@ export function SessionSwitcher({
       {isOpen && (
         <div className="absolute top-full left-0 z-10 mt-1 w-full rounded-md border bg-background shadow-md">
           <div className="max-h-[300px] overflow-auto p-1">
-            {sessions.length > 0 ? (
+            {isLoading ? (
+              <div className="py-4 text-center text-sm text-muted-foreground">
+                Loading sessions...
+              </div>
+            ) : sessions.length > 0 ? (
               <div className="space-y-1">
                 {sessions.map((session) => (
                   <div
@@ -170,7 +198,7 @@ export function SessionSwitcher({
                             </span>
                           </div>
                           <div className="text-xs text-muted-foreground">
-                            Created: {formatDate(session.createdAt)}
+                            Last used: {formatDate(session.lastUsed)}
                           </div>
                         </div>
                         
